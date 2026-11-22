@@ -54,7 +54,7 @@ function startGame(room) {
   const g = {
     board, b: { v: {}, e: {} }, bank: {}, deck: [], turn: 0, rolled: false, pend: null, phase: 'setup',
     setup: { i: 0, step: 's', v: null }, order: [...ids, ...ids.slice().reverse()], log: [], turnNo: 0,
-    robber: board.hexes.findIndex(h => h.kind === 'desert'), longest: null, army: null, offer: null, dice: null, devPlayed: false, vpWin: 10, lens: mk(0, n), winner: null,
+    robber: board.hexes.findIndex(h => h.kind === 'desert'), longest: null, army: null, offer: null, dice: null, devPlayed: false, vpWin: room.settings.vp, lens: mk(0, n), winner: null, deadline: 0,
   };
   R.forEach(r => g.bank[r] = big ? 30 : 19);
   const D = { knight: 14, vp: 5, rb: 2, yop: 2, mono: 2 };
@@ -62,7 +62,8 @@ function startGame(room) {
   shuffle(g.deck);
   room.players.forEach(p => { p.res = Object.fromEntries(R.map(r => [r, 0])); p.dev = []; p.knights = 0; });
   room.g = g; g.turn = g.order[0];
-  log(g, `¡Empieza la partida! Mapa ${big ? 'Grande (5-8 jugadores)' : 'Clásico'}. ${room.players[g.turn].name} coloca primero.`);
+  log(g, `¡Empieza la partida! Mapa ${big ? 'Grande (5-8 jugadores)' : 'Clásico'} · ${g.vpWin} puntos para ganar. ${room.players[g.turn].name} coloca primero.`);
+  setDeadline(room);
 }
 const log = (g, t) => { g.log.push(t); if (g.log.length > 80) g.log.shift(); };
 const cardCount = p => R.reduce((s, r) => s + p.res[r], 0);
@@ -157,6 +158,13 @@ function act(room, pi, m) {
     R.forEach(r => { P.res[r] -= d[r] | 0; g.bank[r] += d[r] | 0; });
     delete g.pend.need[pi]; log(g, `${P.name} descarta ${need} cartas.`);
     if (!Object.keys(g.pend.need).length) g.pend = { t: 'robber' };
+    return;
+  }
+  if (m.type === 'decline') {
+    const o = g.offer; if (!o || o.from === pi) return E('Sin oferta');
+    if (!o.declined.includes(pi)) o.declined.push(pi);
+    if (o.declined.length >= n - 1) { log(g, `Todos rechazaron la oferta de ${room.players[o.from].name}.`); g.offer = null; }
+    else log(g, `${P.name} rechaza la oferta.`);
     return;
   }
   if (m.type === 'accept') {
@@ -256,7 +264,7 @@ function act(room, pi, m) {
       const give = clean(m.give), get = clean(m.get);
       if (!Object.keys(give).length || !Object.keys(get).length) return E('Oferta vacía'); if (!has(P, give)) return E('No tienes eso');
       if (R.some(r => give[r] && get[r])) return E('No puedes ofrecer y pedir lo mismo');
-      g.offer = { from: pi, to: null, give, get }; log(g, `${P.name} propone un intercambio.`); return;
+      g.offer = { from: pi, to: null, give, get, declined: [] }; log(g, `${P.name} propone un intercambio.`); return;
     }
     case 'cancel': g.offer = null; return;
     case 'end': {
@@ -291,7 +299,7 @@ function legal(g, pi) {
   return L;
 }
 function view(room, pi, withBoard) {
-  const base = { code: room.code, host: room.host, me: pi, map: room.g ? room.map : mapOf(room), forceBig: !!room.forceBig, phase: room.g ? room.g.phase : 'lobby',
+  const base = { code: room.code, host: room.host, me: pi, map: room.g ? room.map : mapOf(room), forceBig: !!room.forceBig, settings: room.settings, phase: room.g ? room.g.phase : 'lobby',
     players: room.players.map((p, i) => ({ name: p.name, color: p.color, online: room.conn.has(i) })) };
   const g = room.g; if (!g) return base;
   const B = g.board, me = room.players[pi];
@@ -299,6 +307,8 @@ function view(room, pi, withBoard) {
   base.players = room.players.map((p, i) => ({ name: p.name, color: p.color, online: room.conn.has(i), cards: cardCount(p), dev: p.dev.length, knights: p.knights, vp: pubVP(g, i), road: g.lens[i], roads: roadsOf(g, i), set: count(g, i, false), city: count(g, i, true) }));
   Object.assign(base, {
     b: g.b, robber: g.robber, dice: g.dice, turn: g.turn, rolled: g.rolled, longest: g.longest, army: g.army, winner: g.winner, setup: g.phase === 'setup' ? g.setup.step : null,
+    tn: g.phase === 'setup' ? 's' + g.setup.i : g.turnNo, left: g.deadline ? Math.max(0, g.deadline - Date.now()) : 0, turnTime: room.settings.turnTime,
+    final: g.phase === 'over' ? room.players.map((p, i) => ({ name: p.name, color: p.color, pub: pubVP(g, i), hid: p.dev.filter(c => c.t === 'vp').length, total: totVP(g, room, i) })).sort((a, b) => b.total - a.total || b.pub - a.pub) : null,
     bank: g.bank, deckLeft: g.deck.length, log: g.log.slice(-40), offer: g.offer, vpWin: g.vpWin,
     res: me.res, devs: me.dev.map(c => ({ t: c.t, ok: c.turn < g.turnNo && c.t !== 'vp' })), myVP: totVP(g, room, pi), devPlayed: g.devPlayed,
     ratios: Object.fromEntries(R.map(r => [r, ratio(g, pi, r)])),
@@ -307,6 +317,47 @@ function view(room, pi, withBoard) {
   });
   return base;
 }
+
+// ---------- CRONÓMETRO ----------
+const sig = g => g.turn + '|' + g.phase + '|' + (g.setup ? g.setup.step : '') + '|' + (g.pend ? g.pend.t : '');
+function setDeadline(room) { const g = room.g, t = room.settings.turnTime; g.deadline = t && g.phase !== 'over' ? Date.now() + t * 1000 : 0; }
+function autoPlay(room) {
+  const g = room.g; if (!g || g.phase === 'over') return;
+  const rnd = a => a[Math.floor(Math.random() * a.length)];
+  const resolve = () => {
+    let guard = 0;
+    while (g.pend && guard++ < 60) {
+      const p = g.pend;
+      if (p.t === 'discard') {
+        for (const k of Object.keys(p.need)) {
+          const P = room.players[k], d = {}; const cards = shuffle(R.flatMap(r => mk(r, P.res[r])));
+          cards.slice(0, p.need[k]).forEach(r => d[r] = (d[r] || 0) + 1); act(room, +k, { type: 'discard', res: d });
+        }
+      } else if (p.t === 'robber') act(room, g.turn, { type: 'robber', h: rnd(legal(g, g.turn).h) });
+      else if (p.t === 'steal') act(room, g.turn, { type: 'steal', p: rnd(p.victims) });
+      else if (p.t === 'rb') act(room, g.turn, { type: 'skip' });
+      else break;
+    }
+  };
+  const pi = g.turn;
+  if (g.phase === 'setup') {
+    let L = legal(g, pi);
+    if (g.setup.step === 's') { act(room, pi, { type: 'settle', v: rnd(L.s) }); L = legal(g, pi); }
+    act(room, pi, { type: 'road', e: rnd(L.r) });
+  } else {
+    resolve();
+    if (!g.rolled) act(room, pi, { type: 'roll' });
+    resolve();
+    if (!g.pend) act(room, pi, { type: 'end' });
+  }
+  log(g, `⏱ Tiempo agotado: jugada automática de ${room.players[pi].name}.`);
+}
+setInterval(() => {
+  for (const room of Object.values(rooms)) {
+    const g = room.g; if (!g || g.phase === 'over' || !g.deadline || Date.now() < g.deadline + 300) continue;
+    try { autoPlay(room); checkWin(room); setDeadline(room); broadcast(room); } catch (e) { console.error(e); g.deadline = 0; }
+  }
+}, 1000).unref();
 
 // ---------- SERVIDOR ----------
 const rooms = {};
@@ -343,7 +394,7 @@ const server = http.createServer(async (req, res) => {
       const m = await body(req);
       if (url.pathname === '/api/create') {
         const code = newCode(), token = crypto.randomBytes(12).toString('hex');
-        rooms[code] = { code, map: 'std', forceBig: false, t: Date.now(), host: 0, players: [{ name: String(m.name || 'Jugador').slice(0, 16), color: COLORS[0], token }], conn: new Map(), g: null };
+        rooms[code] = { code, map: 'std', forceBig: false, settings: { turnTime: 60, vp: 10 }, t: Date.now(), host: 0, players: [{ name: String(m.name || 'Jugador').slice(0, 16), color: COLORS[0], token }], conn: new Map(), g: null };
         return json(res, { code, token });
       }
       if (url.pathname === '/api/join') {
@@ -357,6 +408,7 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/api/leave') {
         const { room, pi } = auth(m.code, m.token); if (!room) return json(res, {});
         const c = room.conn.get(pi); if (c) { room.conn.delete(pi); try { c.res.end(); } catch { } }
+        if (room.g && room.g.phase === 'over') { if (!room.conn.size) delete rooms[room.code]; return json(res, {}); }
         if (!room.g) {
           const hostTok = room.players[room.host].token;
           room.players.splice(pi, 1);
@@ -372,17 +424,22 @@ const server = http.createServer(async (req, res) => {
         const { room, pi } = auth(m.code, m.token); if (!room) return json(res, { err: 'Sesión inválida' }, 403);
         let r;
         if (m.type === 'force') { if (pi !== room.host || room.g) return json(res, { err: 'No permitido' }); room.forceBig = !!m.on; }
+        else if (m.type === 'settings') {
+          if (pi !== room.host || room.g) return json(res, { err: 'No permitido' });
+          if ([0, 15, 30, 45, 60].includes(+m.turnTime) && m.turnTime !== undefined) room.settings.turnTime = +m.turnTime;
+          if (m.vp !== undefined && +m.vp >= 6 && +m.vp <= 15) room.settings.vp = +m.vp | 0;
+        }
         else if (m.type === 'start') {
           if (pi !== room.host || room.g) return json(res, { err: 'No permitido' });
           if (room.players.length < 2) return json(res, { err: 'Mínimo 2 jugadores' });
           startGame(room);
-        } else { r = act(room, pi, m); if (!r) checkWin(room); }
+        } else { const b = room.g ? sig(room.g) : ''; r = act(room, pi, m); if (!r) { checkWin(room); if (room.g && sig(room.g) !== b) setDeadline(room); } }
         broadcast(room); return json(res, r || {});
       }
     }
     res.writeHead(404); res.end();
   } catch (e) { console.error(e); res.writeHead(500); res.end(); }
 });
-setInterval(() => { for (const k in rooms) if (!rooms[k].conn.size && Date.now() - rooms[k].t > 3 * 3600e3) delete rooms[k]; }, 600e3).unref();
+setInterval(() => { for (const k in rooms) { const r = rooms[k], idle = Date.now() - r.t; if ((!r.conn.size && idle > 3 * 3600e3) || (r.g && r.g.phase === 'over' && idle > 1800e3)) delete rooms[k]; } }, 600e3).unref();
 if (require.main === module) server.listen(process.env.PORT || 3000, () => console.log('Colonos en puerto ' + (process.env.PORT || 3000)));
-module.exports = { buildBoard, startGame, act, view, rooms, canSettle, canRoad, checkWin };
+module.exports = { autoPlay, setDeadline, buildBoard, startGame, act, view, rooms, canSettle, canRoad, checkWin };
